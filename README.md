@@ -1,4 +1,4 @@
-# 2024 syracuse Football Analytics Blitz
+# 2024 Syracuse Football Analytics Blitz
 
 Won room and overall best presentation.
 - Tasked with projecting and ranking the first 3 seasons of the Big-6 incoming QBs to the 2024 NFL draft in different scheme types.
