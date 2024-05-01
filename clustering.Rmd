@@ -1,0 +1,780 @@
+---
+title: "Blitz"
+author: "Jonah Soos"
+date: "2024-02-18"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(tidyverse)
+library(e1071)
+library(nflfastR)
+library(nflreadr)
+library(tidyverse)
+library(openintro)
+library(tidymodels)
+library(finetune)
+library(vip)
+```
+
+```{r}
+ap <- read_csv("averages_all_plays.csv")
+pp <- read_csv("averages_pass_plays.csv")
+cfb <- read_csv("cfb_data.csv")
+nfl <- read_csv("nfl_data.csv")
+```
+
+```{r}
+nfl$PassingYards <- as.numeric(nfl$PassingYards)
+nfl$RushingYards <- as.numeric(nfl$RushingYards)
+nfl$ThrowDepth <- as.numeric(nfl$ThrowDepth)
+nfl$ToGo <- as.numeric(nfl$ToGo)
+
+depths <- nfl %>% 
+  mutate(
+    short_throw = ifelse(ThrowDepth <= 9, 1, 0),
+    medium_throw = ifelse(ThrowDepth > 9 & ThrowDepth <= 19, 1, 0),
+    deep_throw = ifelse(ThrowDepth > 19, 1, 0),
+    conversion = case_when(
+      (Down == 3 & PassingYards >= ToGo) |
+      (Down == 3 & RushingYards >= ToGo) |
+      (Down == 4 & PassingYards >= ToGo) |
+      (Down == 4 & RushingYards >= ToGo) ~ 1,
+      (Down == 3 & PassingYards < ToGo) |
+      (Down == 3 & RushingYards < ToGo) |
+      (Down == 4 & PassingYards < ToGo) |
+      (Down == 4 & RushingYards < ToGo) ~ 0,
+      TRUE ~ NA_integer_
+    )
+  )
+
+depths %>%
+  group_by(Player, Season) %>%
+  summarise(
+    pct_st = mean(short_throw, na.rm = TRUE)
+  ) -> summary 
+
+depths %>%
+  group_by(Player, Season, Down) %>%
+  summarise(
+    conv_pct = mean(conversion, na.rm = TRUE)
+  ) %>%
+  filter(Down == 3 | Down == 4) %>%
+  ungroup() -> conv
+
+conv %>%
+  group_by(Player, Season) %>%
+  mutate(
+    third_down_conv = ifelse(Down == 3, conv_pct, NA),
+    fourth_down_conv = ifelse(Down == 4, conv_pct, NA)
+  ) %>% ungroup() -> conv
+
+result <- conv %>%
+  select(-Down, -conv_pct) %>%
+  pivot_longer(cols = c(third_down_conv, fourth_down_conv), names_to = "Down", values_to = "Conversion") %>%
+  filter(!is.na(Conversion)) %>%
+  distinct() %>%
+  pivot_wider(names_from = Down, values_from = Conversion)
+
+cfb$PassingYards <- as.numeric(cfb$PassingYards)
+cfb$RushingYards <- as.numeric(cfb$RushingYards)
+cfb$ThrowDepth <- as.numeric(cfb$ThrowDepth)
+cfb$ToGo <- as.numeric(cfb$ToGo)
+
+cfb %>%
+  mutate(
+    conversion = case_when(
+      (Down == 3 & PassingYards >= ToGo) |
+      (Down == 3 & RushingYards >= ToGo) |
+      (Down == 4 & PassingYards >= ToGo) |
+      (Down == 4 & RushingYards >= ToGo) ~ 1,
+      (Down == 3 & PassingYards < ToGo) |
+      (Down == 3 & RushingYards < ToGo) |
+      (Down == 4 & PassingYards < ToGo) |
+      (Down == 4 & RushingYards < ToGo) ~ 0,
+      TRUE ~ NA_integer_
+    )
+  ) -> cfb_2
+
+cfb_2 %>%
+  group_by(Player, Season, Down) %>%
+  summarise(
+    conv_pct = mean(conversion, na.rm = TRUE)
+  ) %>%
+  filter(Down == 3 | Down == 4) %>%
+  ungroup() -> cfb_2
+
+cfb_2 %>%
+  group_by(Player, Season) %>%
+  mutate(
+    third_down_conv = ifelse(Down == 3, conv_pct, NA),
+    fourth_down_conv = ifelse(Down == 4, conv_pct, NA)
+  ) %>% ungroup() -> cfb_dat
+  
+cfb_dat <- cfb_dat %>%
+  select(-Down, -conv_pct) %>%
+  pivot_longer(cols = c(third_down_conv, fourth_down_conv), names_to = "Down", values_to = "Conversion") %>%
+  filter(!is.na(Conversion)) %>%
+  distinct() %>%
+  pivot_wider(names_from = Down, values_from = Conversion)
+
+write_csv(cfb_dat, "cfb_dat.csv")
+
+c_dat_1 <- ap %>%
+  select(-4, -5, -13:-19)
+c_dat_2 <- pp %>%
+  select(1:2, 4:5, 13:19)
+c_dat <- c_dat_1 %>%
+  left_join(c_dat_2, by=c("Player" = "Player", "Season" = "Season"))
+c_dat <- c_dat %>%
+  left_join(summary, by=c("Player" = "Player", "Season" = "Season")) %>%
+  left_join(result, by=c("Player" = "Player", "Season" = "Season")) %>%
+  mutate('heavy_set_pct' = (avg_te + avg_ol))
+
+colnames(c_dat)
+```
+Fuzzy C-Means Clusters
+```{r}
+# Assuming your data frame is named 'df'
+c_dat <- c_dat %>%
+  filter(!is.na(mean_throwdepth))
+
+# Feature Selection (include relevant columns)
+selected_features <- c_dat[, c("pct_st", "motion_pct", "playaction_pct")]
+
+# # Min-max scaling function
+min_max_scale <- function(x) {
+  (x - min(x)) / (max(x) - min(x))
+}
+
+# # Apply min-max scaling to selected features
+scaled_features <- as.data.frame(lapply(selected_features, min_max_scale))
+
+# Use summary stats to set cluster centers
+summary(scaled_features)
+
+# Initializing Clusters
+west_coast_center <- c(0.70, 0.35, 0.35)
+
+bully_ball_center <- c(0.45, 0.50, 0.75)
+
+spread_center <- c(0.60, 0.8, 0.48)
+
+initial_centers <- rbind(west_coast_center, bully_ball_center, spread_center)
+
+# transpose so that rows and columns are flipped
+cluster_centers <- t(initial_centers)
+
+# Perform K-means clustering with initialized centers
+kmeans_clusters <- kmeans(scaled_features[, 1:3], centers = cluster_centers, iter.max = 1000)
+
+kmeans_clusters$centers
+kmeans_clusters$size
+
+# Get cluster assignments
+cluster_assignments <- kmeans_clusters$cluster
+
+# Add cluster assignments to the original dataframe
+c_dat$cluster <- case_when(
+  cluster_assignments == 1 ~ "West Coast",
+  cluster_assignments == 2 ~ "Bully Ball",
+  cluster_assignments == 3 ~ "Spread"
+)
+scaled_features$cluster <- case_when(
+  cluster_assignments == 1 ~ "West Coast",
+  cluster_assignments == 2 ~ "Bully Ball",
+  cluster_assignments == 3 ~ "Spread"
+)
+
+write_csv(c_dat, "c_dat.csv")
+```
+
+viz
+```{r}
+library(rgl)
+library(scatterplot3d)
+
+# Define custom colors for each cluster
+cluster_colors <- c("West Coast" = "black", "Bully Ball" = "blue", "Spread" = "green")
+
+# Reassign colors based on desired cluster assignments
+cluster_match <- cluster_colors[scaled_features$cluster]
+
+# Create 3D scatter plot with custom colors using rgl
+plot1 <- plot3d(scaled_features[, 1:3], 
+       col = cluster_match,
+       type = "s",      # Use 's' for points
+       size = 1)        # Adjust point size as needed)
+
+# Plot the cluster centers
+points3d(kmeans_clusters$centers[, 1], 
+         kmeans_clusters$centers[, 2], 
+         kmeans_clusters$centers[, 3], 
+         col = c("darkgrey", "darkblue", "darkgreen"),  # Colors for cluster centers
+         size = 25,                          # Adjust size as needed
+         add = TRUE)         # Add points to existing plot
+plot1
+
+# Define custom colors for each cluster
+cluster_colors <- c("West Coast" = "black", "Bully Ball" = "blue", "Spread" = "green")
+
+# Reassign colors based on desired cluster assignments
+cluster_match <- cluster_colors[scaled_features$cluster]
+
+# Create 3D scatter plot with custom colors using scatterplot3d
+scatterplot3d(scaled_features[, 1:3], 
+              color = cluster_match,
+              pch = 16,      # Use '16' for filled circles
+              size = 1,      # Adjust point size as needed
+              xlab = "Percent Short Throws",
+              ylab = "Motion %",
+              zlab = "Play Action Pass %",
+              main = "3D Scatter Plot")
+
+ggsave("3D_Cluster.png", plot = plot1, width = 8, height = 6, dpi = 300)
+```
+
+
+```{r}
+draft <- nflreadr::load_draft_picks() %>%
+  select(1, 8) %>%
+  filter(season >= 2018)
+
+c_dat %>%
+  left_join(draft, b=c("Player" = "pfr_player_name") )-> dat_draft
+
+dat_draft %>%
+  arrange(Player, Season) %>%
+  group_by(Player) %>%
+  mutate(
+    first_season = min(Season, na.rm = TRUE),
+    yoe = ifelse(Season - first_season >= 2, 2, Season - first_season)
+  ) -> dat_fin
+
+table(dat_fin$yoe)
+
+write_csv(dat_fin, "dat_fin.csv")
+```
+
+```{r}
+mod_dat <- read_csv("ALL_DATA_WITH_LAG.csv")
+
+data <- mod_dat %>% select(-1:-3) %>%
+  mutate(cluster = ifelse(cluster == "West Coast", 1,
+                   ifelse(cluster == "Bully Ball", 2,
+                   ifelse(cluster == "Spread", 3, 0))))
+
+data %>% filter(cluster == "West Coast" & yoe == "0") %>% select(-14, -15) -> wc_0
+
+#Split the data
+set.seed(1)
+split = initial_split(wc_0, prop = 0.7)
+train = training(split)
+test = testing(split)
+
+#10-fold Cross Validation. Normally dont have to go above 10
+set.seed(2)
+folds <- vfold_cv(wc_0, v = 10)
+folds
+
+#Create the formula
+formula <-
+  recipe(total_passer_points ~ ., #. means everything
+         data = wc_0
+  )
+
+# Specify our model
+specifications <-
+  boost_tree(
+    trees = tune(),
+    min_n = tune(),
+    mtry = tune(),
+    learn_rate = tune(),
+    loss_reduction = tune(),
+    tree_depth = tune()
+  ) %>%
+  set_engine("xgboost") %>%
+  set_mode("regression")
+
+#Match the specifications with the formula
+workflow <- workflow(formula, specifications)
+
+#This is the code to add a grid
+# xgb_grid <- workflow %>%
+#   parameters() %>%
+#   update(
+#     mtry = mtry(range = c(1, 10)),
+#     trees = trees(range = c(10, 2000)),
+#     min_n = min_n(range = c(2, 50)),
+#     learn_rate = learn_rate(range = c(0,.1)),
+#     loss_reduction = loss_reduction(range = c(0, .1))
+#   ) %>%
+#   grid_max_entropy(size = 50)
+
+#This allows you to process in parallel. Saves a lot of time!
+doParallel::registerDoParallel()
+
+#Use tune_race_anova to tune the model
+set.seed(3)
+xgb_rs <- tune_race_anova( # tune race anova: Compares performance of all models after one fold, sees if it is significantly worse and stops training
+  workflow,
+  resamples = folds,
+  grid = 10, # creates random grid, good place to start before a custom grid
+  metrics = metric_set(rmse),
+  control = control_race(verbose_elim = TRUE)
+)
+
+#Examine how the racing went/some of the hyperparameters
+plot_race(xgb_rs)
+autoplot(xgb_rs) # Use these to set custom grid and find exactly what you are looking for
+
+#Look at the best models
+best = show_best(xgb_rs, n = 25)
+
+#Make the final model, you can use select_best or enter the hyperparameters manually
+xgb_last <- workflow %>%
+  finalize_workflow(
+    select_best(xgb_rs, "rmse")
+    # data.frame(
+    #   mtry = 3,
+    #   trees = 844,
+    #   min_n = 4,
+    #   tree_depth = 11,
+    #   learn_rate = 0.0138,
+    #   loss_reduction = 5.57e-10,
+    #   stop_iter = 19)
+    ) %>%
+  last_fit(split)
+
+#Look at the metrics
+xgb_last$.metrics
+
+#Look at the variable importance
+extract_workflow(xgb_last) %>%
+  extract_fit_parsnip() %>%
+  vip(geom = "point", num_features = 25) + 
+  theme_bw()
+
+#Get test set predictions
+final_predictions = collect_predictions(xgb_last)
+
+#Plot Test Set
+ggplot(final_predictions, aes(x = total_passer_points, y = .pred)) +
+  geom_point() +
+  geom_abline() +
+  theme_bw() + 
+  coord_fixed() +
+  xlim(0,50) + 
+  ylim(0,50)
+
+#Plot Histogram
+ggplot(final_predictions, aes(x = total_passer_points)) + geom_histogram()
+```
+
+```{r}
+# Initialize empty lists to store predictions and metrics
+predictions_list <- list()
+metrics_list <- list()
+
+# Loop to run the model 10 times
+for (i in 1:50) {
+  # Split the data
+  set.seed(i)  # Change the seed for each iteration
+  split <- initial_split(wc_0, prop = 0.7)
+  train <- training(split)
+  test <- testing(split)
+  
+  # 10-fold Cross Validation
+  set.seed(i)  # Change the seed for each iteration
+  folds <- vfold_cv(wc_0, v = 10)
+  
+  formula <-
+  recipe(total_passer_points ~ ., #. means everything
+         data = wc_0
+  )
+  
+  # Specify the model
+  specifications <-
+    boost_tree(
+      trees = tune(),
+      min_n = tune(),
+      mtry = tune(),
+      learn_rate = tune(),
+      loss_reduction = tune(),
+      tree_depth = tune()
+    ) %>%
+    set_engine("xgboost") %>%
+    set_mode("regression")
+  
+  # Match the specifications with the formula
+  workflow <- workflow(formula, specifications)
+  
+  # Tune the model
+  set.seed(i)  # Change the seed for each iteration
+  xgb_rs <- tune_race_anova(
+    workflow,
+    resamples = folds,
+    grid = 10,
+    metrics = metric_set(rmse),
+    control = control_race(verbose_elim = TRUE)
+  )
+  
+  # Make the final model
+  xgb_last <- workflow %>%
+    finalize_workflow(select_best(xgb_rs, "rmse")) %>%
+    last_fit(split)
+  
+  # Store the predictions and metrics
+  predictions_list[[i]] <- collect_predictions(xgb_last)
+  metrics_list[[i]] <- xgb_last$.metrics
+}
+
+# Combine predictions and metrics into dataframes
+predictions_df <- do.call(rbind, predictions_list)
+metrics_df <- do.call(rbind, metrics_list)
+
+```
+
+```{r}
+nfl_new <- read_csv("nfl_data_new.csv") %>% mutate(level = 'NFL')
+cfb_new <- read_csv("cfb_data_new.csv") %>% mutate(level = 'CFB') %>%
+  mutate(Player = ifelse(Player == "Gardner Minshew II", "Gardner Minshew", Player))
+dat <- rbind(nfl_new, cfb_new) %>%
+    mutate(rush_att = plays - pass_att)
+dat_new <- dat %>%
+  arrange(Player, Season) %>%
+  group_by(Player) %>%
+  filter(any(level == "NFL")) %>%
+  mutate(NFL_Rookie = ifelse(level == "NFL", min(Season[level == "NFL"]), NA_integer_)) %>%
+  ungroup() %>%
+  fill(NFL_Rookie, .direction = "up") %>%
+  mutate(yoe = Season - NFL_Rookie) %>%
+  select(1, 8, 2:4, 17, 5:8, 9:16, 18:19) %>%
+  mutate(tackles_missed_rate = tackles_missed_rate / 100) %>%
+  select(-9, -11)
+
+# Function to calculate weighted performance change
+calculate_weighted_performance_change <- function(data) {
+  data <- data %>%
+    arrange(Player, Season) %>%
+    group_by(Player) %>%
+    mutate_at(vars(7:13), list(change = ~ ((. - lag(.)) * mean(c(lag(pass_att), pass_att), na.rm = TRUE)))) %>%
+    mutate_at(vars(14), list(tackles_missed_rate_ch = ~ ((. - lag(.)) * mean(c(lag(rush_att), rush_att), na.rm = TRUE))))
+  return(data)
+}
+
+cdat <- calculate_weighted_performance_change(dat_new)
+
+summarize_weighted_performance_change <- function(data) {
+  # Summarize
+  summary_data <- data %>%
+    group_by(yoe) %>%
+    summarise(
+      across(ends_with("change"), sum, na.rm = TRUE) / sum(pass_att, na.rm = TRUE),
+      tackles_missed_rate_ch = sum(tackles_missed_rate_ch, na.rm = TRUE) / sum(rush_att, na.rm = TRUE),
+      count = n()  # Count number of observations for each yoe
+    )
+  
+  return(summary_data)
+}
+
+# Apply the function to your dataset
+summary_data <- summarize_weighted_performance_change(cdat) %>%
+  rename(tackles_missed_rate_change = tackles_missed_rate_ch)
+
+# Define the columns of interest
+columns_of_interest <- names(summary_data)[2:9]
+
+# Create a list to store the plots
+plots_change <- list()
+
+# Loop over each column of interest and create a plot
+for (col in columns_of_interest) {
+  plot <- ggplot(summary_data, aes(x = yoe, y = !!sym(col))) +
+    geom_point() +
+    geom_smooth(se = TRUE) +
+    theme_bw() +
+    labs(x = "Years of Experience (yoe)", y = col) +
+    xlim(-3, 3)
+  
+  plots_change[[col]] <- plot
+}
+
+# Print the plots
+for (col in columns_of_interest) {
+  print(plots_change[[col]])
+}
+
+# Manually assign colors to each statistic
+statistic_colors <- c("to_rate_change" = "blue",
+                      "on_target_short_change" = "forestgreen",
+                      "tackles_missed_rate_change" = "darkblue",
+                      "on_target_deep_change" = "darkorchid4",
+                      "third_fourth_comp_pct_change" = "purple",
+                      "oop_comp_pct_change" = "darkorange",
+                      "hurry_sack_ratio_change" = "lightblue",
+                      "notplanted_ontargetpct_change" = "firebrick")
+
+# Define the new labels for the legend key
+new_labels <- c("Sack-to-Hurry Ratio",
+                "Non-Planted On-Target %",
+                "On-Target Deep %",
+                "On-Target Short %",
+                "Out-Of-Pocket Completion %",
+                "Tackles Missed Rate",
+                "3rd & 4th down Past-Sticks Completion %",
+                "Turnover Rate")
+
+# Combine all plots into one plot
+combined_plot <- ggplot(summary_data, aes(x = yoe)) +
+  # Loop over each column of interest and add a line to the plot
+  lapply(names(statistic_colors), function(col) {
+    geom_line(aes(y = !!sym(col), color = col), size = 1.2, data = summary_data)
+  }) +
+  scale_color_manual(values = statistic_colors, labels = new_labels) +
+  theme_bw() +
+  labs(x = "Years of Experience (yoe)", y = "Percent Change by Year of Experience") +
+  scale_y_continuous(limits = c(-0.15, 0.15)) +  # Set y-axis limits from -0.2 to 0.2
+  scale_x_continuous(limits = c(-3, 3)) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "black", size = 1.2) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black", size = 1.2) +
+  theme(legend.position = "right") +  # Move legend to the top
+  guides(color = guide_legend(title = "Statistic"))  # Customize legend title
+
+# Print the combined plot
+print(combined_plot)
+
+# Define the file name for the PNG file
+ggsave("change_plot.png", combined_plot, width = 10, height = 6, dpi = 300)
+
+```
+
+
+```{r}
+grouped_change <- summary_data %>%
+  mutate(to_rate_change = to_rate_change * -1,
+         hurry_sack_ratio_change = hurry_sack_ratio_change * -1)
+grouped_data <- grouped_change %>%
+  mutate(Accuracy = (on_target_deep_change + on_target_short_change) / 2,
+         Improvisation = (oop_comp_pct_change + notplanted_ontargetpct_change) / 2,
+         Mobility = (hurry_sack_ratio_change + tackles_missed_rate_change) / 2,
+         "Decision Making" = (to_rate_change + third_fourth_comp_pct_change) / 2) %>%
+  select(yoe, Accuracy, Improvisation, Mobility, "Decision Making")
+
+# Manually assign colors to each statistic
+stat_colors <- c("Accuracy" = "blue",
+                 "Improvisation" = "forestgreen",
+                 "Mobility" = "darkorange",
+                 "Decision Making" = "firebrick")
+
+# Combine all plots into one plot
+plot_sum <- ggplot(grouped_data, aes(x = yoe)) +
+  # Loop over each column of interest and add a line to the plot
+  lapply(names(stat_colors), function(col) {
+    geom_line(aes(y = !!sym(col), color = col), size = 1.2)
+  }) +
+  scale_color_manual(values = stat_colors) +
+  theme_bw() +
+  labs(x = "Years of Experience (yoe)", y = "Percent Improvement by Year of Experience") +
+  scale_y_continuous(limits = c(-0.15, 0.05)) +  # Set y-axis limits from -0.2 to 0.2
+  scale_x_continuous(limits = c(-3, 3)) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "black", size = 1.2) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black", size = 1.2) +
+  theme(legend.position = "right") +  # Move legend to the top
+  guides(color = guide_legend(title = "Stat Group"))  # Customize legend title
+
+print(plot_sum)
+
+ggsave("plot_sum.png", plot_sum, width = 10, height = 6, dpi = 300)
+```
+
+
+
+
+
+```{r}
+# Function to calculate weighted performance
+calculate_weighted_performance <- function(data) {
+  data <- data %>%
+    arrange(Player, Season) %>%
+    group_by(Player) %>%
+    mutate_at(vars(7:13), list(wp = ~ . * pass_att)) %>%
+    mutate_at(vars(14), list(tackles_missed_rate_wp_r = ~ . * rush_att))
+  
+  return(data)
+}
+
+wdat <- calculate_weighted_performance(dat_new)
+
+# Function to summarize weighted performance by yoe and get count of observations
+summarize_weighted_performance <- function(data) {
+  summary_data <- data %>%
+    group_by(yoe) %>%
+    summarise(
+      across(ends_with("_wp"), ~ sum(., na.rm = TRUE)/sum(pass_att, na.rm = TRUE)),
+      across(ends_with("_wp_r"), ~ sum(., na.rm = TRUE)/sum(rush_att, na.rm = TRUE)),
+      count = n() # Calculate weighted performance
+    )
+  
+  return(summary_data)
+}
+
+# Apply the function to your dataset
+wdat_sum <- summarize_weighted_performance(wdat) %>%
+  rename(tackles_missed_rate_wp = tackles_missed_rate_wp_r)
+
+# Define the columns of interest
+columns_of_interest <- names(wdat_sum)[2:9]
+
+write_csv(summary_data, "Variable_wMean_Change_by_YOE.csv")
+write_csv(wdat_sum, "Variable_wAverage_by_YOE.csv")
+```
+
+```{r}
+rookies <- dat %>%
+  select(1, 8, 2:4, 17, 5:8, 9:16) %>%
+  group_by(Player) %>%
+    mutate(tackles_missed_rate = tackles_missed_rate / 100) %>%
+  select(-9, -11) %>%
+  filter(!any(level == "NFL")) %>%
+  mutate(yoe = ifelse(Season == 2023, -1,
+               ifelse(Season == 2022, -2,
+               ifelse(Season == 2021, -3,
+               ifelse(Season == 2020, -4,
+               ifelse(Season == 2019, -5, NA))))))
+
+# Create a data frame to store the stats for yoe == 0
+rookies_y0 <- rookies %>%
+  filter(yoe == -1) %>%
+  mutate(yoe = 0)  # Change yoe from -1 to 0
+
+# Join with summary_data for yoe == 0
+rookies_y0 <- left_join(rookies_y0, summary_data %>% filter(yoe == 0), by = "yoe")
+
+# Identify the columns you want to multiply by the corresponding _change columns
+columns_to_multiply <- c("to_rate", "hurry_sack_ratio", "tackles_missed_rate", 
+                         "on_target_short", "notplanted_ontargetpct", "on_target_deep", 
+                         "third_fourth_comp_pct", "oop_comp_pct")
+
+# Apply the multiplication and replace the original columns
+rookies_y0 <- rookies_y0 %>%
+  mutate(tackles_missed_rate = tackles_missed_rate + 0.05,
+         on_target_short = on_target_short + 0.025,
+         on_target_deep = on_target_deep + 0.05) %>%
+  mutate(across(all_of(columns_to_multiply), ~ . + get(paste0(cur_column(), "_change")))) %>%
+  mutate(tackles_missed_rate = ifelse(tackles_missed_rate <= 0.01, runif(1, min = 0, max = 0.01), tackles_missed_rate)) %>%
+  select(-17:-25)
+
+# Create a data frame to store the stats for yoe == 0
+rookies_y1 <- rookies_y0 %>%
+  filter(yoe == 0) %>%
+  mutate(yoe = 1)  # Change yoe from -1 to 0
+
+# Join with summary_data for yoe == 0
+rookies_y1 <- left_join(rookies_y1, summary_data %>% filter(yoe == 1), by = "yoe")
+
+# Apply the multiplication and replace the original columns
+rookies_y1 <- rookies_y1 %>%
+  mutate(across(all_of(columns_to_multiply), ~ . + get(paste0(cur_column(), "_change")))) %>%
+  select(-17:-25)
+
+# Create a data frame to store the stats for yoe == 0
+rookies_y2 <- rookies_y1 %>%
+  filter(yoe == 1) %>%
+  mutate(yoe = 2)  # Change yoe from -1 to 0
+
+# Join with summary_data for yoe == 0
+rookies_y2 <- left_join(rookies_y2, summary_data %>% filter(yoe == 2), by = "yoe")
+
+# Apply the multiplication and replace the original columns
+rookies_y2 <- rookies_y2 %>%
+  mutate(across(all_of(columns_to_multiply), ~ . + get(paste0(cur_column(), "_change")))) %>%
+  select(-17:-25)
+
+rookies <- rbind(rookies, rookies_y0, rookies_y1, rookies_y2)
+
+# Reshape the data from wide to long format
+rookies_long <- rookies %>%
+  pivot_longer(cols = all_of(columns_to_multiply),
+               names_to = "Variable",
+               values_to = "Value")
+
+# Plot the data
+ggplot(rookies_long, aes(x = yoe, y = Value, color = Player)) +
+  geom_line() +
+  facet_wrap(~ Variable, scales = "free_y") +
+  labs(x = "Years of Experience (yoe)", y = "Value", color = "Player") +
+  theme_minimal()
+
+```
+```{r}
+# write_csv(rookies, "rookies.csv")
+
+# Add _wp to the end of the column names in columns 6:13
+rookies_wp <- rookies %>%
+  rename_with(~ paste0(., "_wp"), matches("to_rate|on_target_short|tackles_missed_rate|on_target_deep|third_fourth_comp_pct|oop_comp_pct|hurry_sack_ratio|notplanted_ontargetpct"))
+
+# Define custom colors for each player
+player_colors <- c("Michael Penix Jr." = "darkviolet", 
+                   "J.J. McCarthy" = "#00274C", 
+                   "Bo Nix" = "forestgreen",
+                   "Caleb Williams" = "#990000",
+                   "Drake Maye" = "#7BAFD4",
+                   "Jayden Daniels" = "#FDD023")  # Add more colors as needed
+
+columns_of_interest <- names(wdat_sum)[2:9]
+
+# Create a list to store the plots
+plots <- list()
+# Define a directory to save the PNG files
+output_dir <- "plots/"
+
+# Create the directory if it doesn't exist
+dir.create(output_dir, showWarnings = FALSE)
+
+# Loop over each column of interest and create a plot
+for (col in columns_of_interest) {
+  # Define the y-axis label based on the column being plotted
+  y_label <- switch(col,
+                    to_rate_wp = "Turnover Rate (per pass attempt)",
+                    hurry_sack_ratio_wp = "Sacks to Hurries Ratio",
+                    on_target_short_wp = "On-Target % - Short Passes",
+                    on_target_deep_wp = "On-Target % - Deep Passes",
+                    third_fourth_comp_pct_wp = "3rd & 4th down Past-Sticks Completion %",
+                    oop_comp_pct_wp = "Out-Of-Pocket Completion %",
+                    notplanted_ontargetpct_wp = "On-Target % - Not Planted",
+                    tackles_missed_rate_wp = "Tackles Missed Rate (on rush attempts)") 
+
+  plot <- ggplot(wdat_sum, aes(x = yoe, y = !!sym(col))) +
+    geom_point() +
+    geom_smooth(se = TRUE, aes(color = "Lowess Smoothing")) +  # Add lowess smoothing curve
+    geom_line(data = rookies_wp, aes(group = Player, color = Player), size = 1.1) +  # Adjust the line width here (e.g., size = 1.2)
+    scale_color_manual(values = c(player_colors, "Lowess Smoothing" = "blue")) +  # Include Lowess Smoothing in color scale
+    geom_vline(xintercept = 0, linetype = "dashed", color = "black", size = 1.5) +  # Add a black dotted line at YOE = 0
+    theme_bw() +
+    labs(x = "Years of Experience (yoe)", y = y_label, color = "Key") +  # Use the defined y-axis label here and change legend title
+    xlim(-3, 3) +
+    theme(legend.key = element_rect(fill = "white", color = "white"))  # Set legend background to white with no border
+  
+  # Define the file name for the PNG file
+  png_file <- paste0(output_dir, "plot_", col, ".png")
+
+  # Save the plot as a PNG file
+  ggsave(png_file, plot, width = 10, height = 6, dpi = 300)  # Adjust width, height, and dpi as needed
+  
+  plots[[col]] <- plot
+}
+
+# Print the plots
+for (col in columns_of_interest) {
+  print(plots[[col]])
+}
+
+
+
+```
+
